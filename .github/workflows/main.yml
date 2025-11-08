@@ -21,3 +21,286 @@ OctaMorphAI/
 ├── foundry.toml
 ├── README.md
 └── PITCH_DECK.md
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.18;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+interface IERC4626Minimal {
+    function deposit(uint256 assets, address receiver) external returns (uint256 shares);
+    function withdraw(uint256 assets, address receiver, address owner) external;
+    function totalAssets() external view returns (uint256);
+}
+
+interface IStrategyAdapter {
+    function deposit(uint256 amount) external returns (uint256);
+    function withdraw(uint256 amount) external returns (uint256);
+    function totalAssets() external view returns (uint256);
+    function protocolName() external view returns (string memory);
+}
+
+contract OctaMorphVault is ERC20, Ownable, Pausable, IERC4626Minimal {
+    IERC20 public immutable asset;
+
+    address[] public adapters;
+    address public activeAdapter;
+
+    uint16 public publicGoodsBps = 2000; // 20%
+    address public publicGoodsRouter;
+
+    address public keeper;
+
+    uint256 public epochLength = 7 days;
+    uint256 public lastEpoch;
+
+    constructor(IERC20 _asset, address _publicGoodsRouter) ERC20("OctaMorph Share","oMORPH") {
+        asset = _asset;
+        publicGoodsRouter = _publicGoodsRouter;
+        lastEpoch = block.timestamp;
+    }
+
+    modifier onlyKeeper() {
+        require(msg.sender == keeper || msg.sender == owner(), "not keeper");
+        _;
+    }
+
+    function setKeeper(address _k) external onlyOwner { keeper = _k; }
+    function setActiveAdapter(address _a) external onlyOwner { activeAdapter = _a; }
+    function setPublicGoodsRouter(address _r) external onlyOwner { publicGoodsRouter = _r; }
+    function setPublicGoodsBps(uint16 _bps) external onlyOwner { publicGoodsBps = _bps; }
+
+    function totalAssets() public view override returns (uint256) {
+        if (activeAdapter == address(0)) return asset.balanceOf(address(this));
+        return IStrategyAdapter(activeAdapter).totalAssets() + asset.balanceOf(address(this));
+    }
+
+    function deposit(uint256 assets, address receiver) external whenNotPaused returns (uint256 shares) {
+        require(asset.transferFrom(msg.sender, address(this), assets), "transfer failed");
+        // simple 1:1 shares (MVP)
+        shares = assets;
+        _mint(receiver, shares);
+        emit Deposit(msg.sender, receiver, assets, shares);
+    }
+
+    function withdraw(uint256 assets, address receiver, address owner_) external whenNotPaused {
+        uint256 shares = assets;
+        if (msg.sender != owner_) {
+            _spendAllowance(owner_, msg.sender, shares);
+        }
+        _burn(owner_, shares);
+        require(asset.transfer(receiver, assets), "transfer failed");
+        emit Withdraw(msg.sender, receiver, owner_, assets, shares);
+    }
+
+    // Keeper-triggered rebalance: withdraws full assets from activeAdapter, deposits to newAdapter
+    function rebalance(address newAdapter, uint256 minReturnBps) external onlyKeeper whenNotPaused {
+        require(newAdapter != address(0), "zero adapter");
+        uint256 before = totalAssets();
+        if (activeAdapter != address(0)) {
+            // withdraw all from old
+            uint256 amt = IStrategyAdapter(activeAdapter).totalAssets();
+            IStrategyAdapter(activeAdapter).withdraw(amt);
+        }
+        uint256 vaultBal = asset.balanceOf(address(this));
+        // deposit into new adapter
+        asset.approve(newAdapter, vaultBal);
+        IStrategyAdapter(newAdapter).deposit(vaultBal);
+        activeAdapter = newAdapter;
+        uint256 after = totalAssets();
+        // basic slippage check
+        require(after * 10000 / before >= minReturnBps, "slippage too high");
+        emit Rebalanced(activeAdapter, before, after);
+    }
+
+    // epoch distribution
+    function distributeEpoch() external onlyKeeper whenNotPaused {
+        require(block.timestamp >= lastEpoch + epochLength, "epoch not passed");
+        uint256 earnings = _collectYield();
+        if (earnings == 0) { lastEpoch = block.timestamp; return; }
+        uint256 toPublic = (earnings * publicGoodsBps) / 10000;
+        // transfer to router
+        require(asset.transfer(publicGoodsRouter, toPublic), "pg transfer failed");
+        lastEpoch = block.timestamp;
+        emit EpochDistributed(earnings, toPublic);
+    }
+
+    // Simplified collect: assume vault holds earned tokens
+    function _collectYield() internal returns (uint256) {
+        // For MVP, simulate: return current vault balance minus totalSupply (approx)
+        uint256 vaultBal = asset.balanceOf(address(this));
+        uint256 supply = totalSupply();
+        if (vaultBal <= supply) return 0;
+        uint256 earnings = vaultBal - supply;
+        return earnings;
+    }
+
+    event Deposit(address indexed caller, address indexed owner, uint256 assets, uint256 shares);
+    event Withdraw(address indexed caller, address indexed receiver, address indexed owner, uint256 assets, uint256 shares);
+    event Rebalanced(address adapter, uint256 beforeAssets, uint256 afterAssets);
+    event EpochDistributed(uint256 earnings, uint256 toPublic);
+}// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.18;
+
+interface IStrategyAdapter {
+    function deposit(uint256 amount) external returns (uint256);
+    function withdraw(uint256 amount) external returns (uint256);
+    function totalAssets() external view returns (uint256);
+    function protocolName() external view returns (string memory);
+}// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.18;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "./IStrategyAdapter.sol";
+
+contract MockAdapter is IStrategyAdapter {
+    IERC20 public immutable asset;
+    address public vault;
+    uint256 public accounted; // simulated assets
+    string public name;
+
+    constructor(IERC20 _asset, address _vault, string memory _name) {
+        asset = _asset;
+        vault = _vault;
+        name = _name;
+    }
+
+    function protocolName() external view returns (string memory) { return name; }
+
+    function deposit(uint256 amount) external returns (uint256) {
+        require(msg.sender == vault, "only vault");
+        require(asset.transferFrom(vault, address(this), amount), "transfer failed");
+        accounted += amount;
+        return amount;
+    }
+
+    function withdraw(uint256 amount) external returns (uint256) {
+        require(msg.sender == vault, "only vault");
+        if (amount > accounted) amount = accounted;
+        accounted -= amount;
+        require(asset.transfer(vault, amount), "transfer failed");
+        return amount;
+    }
+
+    function totalAssets() external view returns (uint256) { return accounted; }
+}// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.18;
+
+contract ImpactOracle {
+    address public signer;
+    mapping(bytes32 => uint256) public impactScore; // id -> score (0-10000)
+
+    constructor(address _signer) { signer = _signer; }
+    function updateScores(bytes32[] calldata ids, uint256[] calldata scores) external {
+        // MVP: restrict to signer for hackathon
+        require(msg.sender == signer, "not signer");
+        for (uint i=0;i<ids.length;i++) impactScore[ids[i]] = scores[i];
+    }
+    function getScore(bytes32 id) external view returns (uint256) { return impactScore[id]; }
+}// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.18;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract PublicGoodsRouter {
+    address public owner;
+    address[] public beneficiaries;
+    uint256[] public weights; // sum to 10000
+
+    constructor(address[] memory _bens, uint256[] memory _weights) {
+        owner = msg.sender;
+        beneficiaries = _bens;
+        weights = _weights;
+    }
+
+    function distribute(IERC20 token) external {
+        uint256 bal = token.balanceOf(address(this));
+        for (uint i=0;i<beneficiaries.length;i++) {
+            uint256 amt = bal * weights[i] / 10000;
+            if (amt > 0) token.transfer(beneficiaries[i], amt);
+        }
+    }
+
+    function emergencyWithdraw(IERC20 token, address to) external {
+        require(msg.sender == owner, "owner only");
+        uint256 bal = token.balanceOf(address(this));
+        if (bal > 0) token.transfer(to, bal);
+    }
+}# score_engine.py
+# Minimal heuristic scoring engine: fetches basic rates from simulated sources and returns signed payload
+import json
+import time
+from eth_account import Account
+from eth_account.messages import encode_defunct
+
+PRIVATE_KEY = "0xYOUR_PRIVATE_KEY"
+
+def normalize(x, a, b):
+    if b==a: return 0.0
+    return (x - a)/(b-a)
+
+def compute_scores(strategies):
+    # strategies: list of dict with keys: id, yield, liquidity, risk, impact
+    results = []
+    for s in strategies:
+        ny = normalize(s['yield'], 0, 20)
+        nl = normalize(s['liquidity'], 0, 1e9)
+        ni = normalize(s['impact'], 0, 10000)
+        nr = normalize(s['risk'], 0, 100)
+        score = 0.5*ny + 0.2*nl + 0.15*ni - 0.15*nr
+        results.append({ 'id': s['id'], 'score': score })
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results
+
+if __name__ == '__main__':
+    # example data
+    strategies = [
+        { 'id':'adapter-aave','yield':4.3,'liquidity':500000000,'risk':10,'impact':50 },
+        { 'id':'adapter-lido','yield':3.5,'liquidity':1000000000,'risk':5,'impact':200 }
+    ]
+    scores = compute_scores(strategies)
+    payload = { 'timestamp': int(time.time()), 'strategies': scores }
+    msg = encode_defunct(text=json.dumps(payload))
+    acct = Account.from_key(PRIVATE_KEY)
+    sig = acct.sign_message(msg)
+    print(json.dumps({ 'payload': payload, 'signature': sig.signature.hex() }))
+    # runKeeper.py
+# Simple keeper that fetches signed recommendation from ai_engine (or local) and calls rebalance on vault
+from web3 import Web3
+import json
+
+# configure: RPC, contract addresses, signer
+RPC = "http://127.0.0.1:8545"
+w3 = Web3(Web3.HTTPProvider(RPC))
+
+# minimal keeper: loads payload.json and calls rebalance via owner account
+import React from 'react'
+export default function Home(){
+  return (
+    <div style={{padding:40,fontFamily:'sans-serif'}}>
+      <h1>OctaMorph AI — Demo Dashboard</h1>
+      <p>Live allocations, rebalancer log, and public goods payouts (MVP)</p>
+      <pre>{`Allocation:\nAave: 70%\nLido: 30%\nPublic Goods split: Gitcoin 100%`}</pre>
+    </div>
+  )
+}const { expect } = require("chai");
+const { ethers } = require("hardhat");
+
+describe("OctaMorphVault MVP", function(){
+  it("deposit and mint shares", async function(){
+    const [owner, user] = await ethers.getSigners();
+    const ERC20 = await ethers.getContractFactory("ERC20Mock");
+    const token = await ERC20.deploy("USDC","USDC", 6);
+    await token.deployed();
+    // mint to user
+    await token.mint(user.address, ethers.utils.parseUnits('1000',6));
+    const Vault = await ethers.getContractFactory("OctaMorphVault");
+    const routerAddr = owner.address; // dummy
+    const vault = await Vault.deploy(token.address, routerAddr);
+    await vault.deployed();
+    await token.connect(user).approve(vault.address, ethers.utils.parseUnits('100',6));
+    await vault.connect(user).deposit(ethers.utils.parseUnits('100',6), user.address);
+    expect(await vault.totalSupply()).to.equal(ethers.utils.parseUnits('100',6));
+  });
+});See top-level README in the canvas. Run tests with Hardhat or Foundry. Use local Anvil/Hardhat fork for integration tests.
