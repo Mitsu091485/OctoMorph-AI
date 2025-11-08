@@ -1,0 +1,23 @@
+OctaMorphAI/
+├── contracts/
+│   ├── OctaMorphVault.sol
+│   ├── IStrategyAdapter.sol
+│   ├── MockAdapter.sol
+│   ├── AaveAdapter.sol    # optional (fork-only)
+│   ├── ImpactOracle.sol
+│   └── PublicGoodsRouter.sol
+├── scripts/
+│   ├── deploy.js
+│   └── runKeeper.py
+├── ai_engine/
+│   ├── score_engine.py
+│   └── signer.py
+├── frontend/
+│   ├── package.json
+│   └── pages/index.js
+├── test/
+│   ├── vault.test.js
+│   └── adapters.test.js
+├── foundry.toml
+├── README.md
+└── PITCH_DECK.md
